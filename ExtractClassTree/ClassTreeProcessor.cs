@@ -29,6 +29,7 @@ public class ClassTreeProcessor
     private ulong processedData;
 
     private ulong lineCount;
+    private ulong superclassCount;
 
     private readonly object doneSync = new();
 
@@ -64,13 +65,13 @@ public class ClassTreeProcessor
             while (!Monitor.Wait(doneSync, 2500))
             {
                 var time = stopwatch.ElapsedMilliseconds;
-                Console.WriteLine($"Decompressed {decompressedData} bytes ({decompressedData / (float)time:F2} kB/s), processed {processedData} bytes ({processedData / (float)time:F2} kB/s), found {lineCount} lines, duration {time * 0.001f:F1} s, waited {waitedForBuffer} for buffer, {waitedForData} for data...");
+                Console.WriteLine($"Decompressed {decompressedData} bytes ({decompressedData / (float)time:F2} kB/s), processed {processedData} bytes ({processedData / (float)time:F2} kB/s), found {superclassCount}/{lineCount} lines, duration {time * 0.001f:F1} s, waited {waitedForBuffer} for buffer, {waitedForData} for data...");
             }
         }
         stopwatch.Stop();
 
         var totalTime = stopwatch.ElapsedMilliseconds;
-        Console.WriteLine($"Done! Decompressed {decompressedData} bytes ({decompressedData / (float)totalTime:F2} kB/s), processed {processedData} bytes ({processedData / (float)totalTime:F2} kB/s), found {lineCount} lines, duration {totalTime * 0.001f:F1} s, waited {waitedForBuffer} for buffer, {waitedForData} for data...");
+        Console.WriteLine($"Done! Decompressed {decompressedData} bytes ({decompressedData / (float)totalTime:F2} kB/s), processed {processedData} bytes ({processedData / (float)totalTime:F2} kB/s), found {superclassCount}/{lineCount} lines, duration {totalTime * 0.001f:F1} s, waited {waitedForBuffer} for buffer, {waitedForData} for data...");
     }
 
     private void DecompressionThreadProc()
@@ -151,6 +152,9 @@ public class ClassTreeProcessor
         return readTotal;
     }
 
+    private readonly byte[] crossBufferLineBuffer = new byte[BufferSize];
+    private int crossBufferLineBufferLen;
+
     unsafe uint ProcessData(byte[] buffer)
     {
         fixed (byte* pBuffer = buffer)
@@ -173,7 +177,22 @@ public class ClassTreeProcessor
                 }
             }
 
-            // TODO: Store cross-buffer line beginning
+            // TODO? This could be done zero-copy, just if we used more buffers than just two
+            if (pLineStart == null)
+            {
+                // ??! no line end in the buffer!
+                throw new FormatException("Too long line?!");
+            }
+            var lineLen = pBuffEnd - pLineStart;
+            if (lineLen > BufferSize) throw new FormatException("Too long line");
+
+            if (lineLen > 0)
+            {
+                var line = new ReadOnlySpan<byte>(pLineStart, (int)lineLen);
+                line.CopyTo(crossBufferLineBuffer);
+            }
+            crossBufferLineBuffer[lineLen] = 0;
+            crossBufferLineBufferLen = (int)lineLen;
         }
 
         return BufferSize;
@@ -183,7 +202,15 @@ public class ClassTreeProcessor
     {
         if (pLineStart == null)
         {
-            // TODO: Process cross-buffer lines
+            Debug.Assert(pBuffer != null);
+            var lineTailLen = pLineEnd - pBuffer;
+            if (crossBufferLineBufferLen + lineTailLen > BufferSize) throw new FormatException("Too long cross-buffer line");
+            var lineTail = new ReadOnlySpan<byte>(pBuffer, (int)lineTailLen);
+            lineTail.CopyTo(new Span<byte>(crossBufferLineBuffer, crossBufferLineBufferLen, (int)lineTailLen));
+            fixed (byte* pCrossBufferLineBuffer = crossBufferLineBuffer)
+            {
+                ProcessLine(pCrossBufferLineBuffer, pCrossBufferLineBuffer + crossBufferLineBufferLen + lineTailLen, null);
+            }
             return;
         }
         if (pLineEnd == pLineStart)
@@ -218,6 +245,8 @@ public class ClassTreeProcessor
         {
             classQid = (classQid * 10) + (*pClassQid - '0');
         }
+
+        ++superclassCount;
     }
 
     private static void SwitchBoolFlag(ref int flag, bool from, bool to)
