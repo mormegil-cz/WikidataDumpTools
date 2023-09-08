@@ -7,6 +7,8 @@ namespace ExtractClassTree;
 public class ClassTreeProcessor
 {
     private const int BufferSize = 0x10000;
+    private static readonly ReadOnlyMemory<byte> QPrefix = "<http://www.wikidata.org/entity/Q"u8.ToArray();
+    private static readonly ReadOnlyMemory<byte> P279Prop = "<http://www.wikidata.org/prop/direct/P279>"u8.ToArray();
 
     private readonly byte[][] buffers =
     {
@@ -151,25 +153,71 @@ public class ClassTreeProcessor
 
     unsafe uint ProcessData(byte[] buffer)
     {
-        fixed (byte* bufPointer = buffer)
+        fixed (byte* pBuffer = buffer)
         {
-            var p = bufPointer;
-            for (int i = 0; i < BufferSize; ++i)
+            byte* pLineStart = null;
+            byte* pBuffEnd = pBuffer + BufferSize;
+            for (var p = pBuffer; p < pBuffEnd; ++p)
             {
                 var curr = *p;
                 if (curr == 0)
                 {
-                    // end of buffer
-                    return (uint)i;
+                    // end of input
+                    return (uint)(p - pBuffer);
                 }
                 if (curr == '\n')
                 {
                     ++lineCount;
+                    ProcessLine(pLineStart, p, pBuffer);
+                    pLineStart = p + 1;
                 }
-                ++p;
             }
+
+            // TODO: Store cross-buffer line beginning
         }
+
         return BufferSize;
+    }
+
+    private unsafe void ProcessLine(byte* pLineStart, byte* pLineEnd, byte* pBuffer)
+    {
+        if (pLineStart == null)
+        {
+            // TODO: Process cross-buffer lines
+            return;
+        }
+        if (pLineEnd == pLineStart)
+        {
+            // empty line?
+            return;
+        }
+
+        var lineSpan = new ReadOnlySpan<byte>(pLineStart, (int)(pLineEnd - pLineStart - 1));
+        if (!lineSpan.StartsWith(QPrefix.Span)) return;
+
+        // parse qid
+        var qid = 0;
+        byte* pQid;
+        for (pQid = pLineStart + QPrefix.Length; pQid < pLineEnd && *pQid != '>'; ++pQid)
+        {
+            qid = (qid * 10) + (*pQid - '0');
+        }
+
+        // check if P279
+        var pProp = pQid + 2; // "> "
+        var propSpan = new ReadOnlySpan<byte>(pProp, (int)(pLineEnd - pProp - 1));
+        if (!propSpan.StartsWith(P279Prop.Span)) return;
+
+        var pObject = pProp + P279Prop.Length + 1;
+        var objectSpan = new ReadOnlySpan<byte>(pObject, (int)(pLineEnd - pObject - 1));
+        if (!objectSpan.StartsWith(QPrefix.Span)) return; // ??!?
+
+        var classQid = 0;
+        byte* pClassQid;
+        for (pClassQid = pObject + QPrefix.Length; pClassQid < pLineEnd && *pClassQid != '>'; ++pClassQid)
+        {
+            classQid = (classQid * 10) + (*pClassQid - '0');
+        }
     }
 
     private static void SwitchBoolFlag(ref int flag, bool from, bool to)
