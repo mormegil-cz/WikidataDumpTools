@@ -29,6 +29,8 @@ public class ClassTreeProcessor : IDisposable, IAsyncDisposable
 
     private ulong decompressedData;
     private ulong processedData;
+    private long compressedPosition;
+    private long compressedSize;
 
     private readonly object doneSync = new();
 
@@ -43,7 +45,7 @@ public class ClassTreeProcessor : IDisposable, IAsyncDisposable
     private readonly BinaryWriter outputFile;
 
     private ulong superClassCount;
-    
+
     public ClassTreeProcessor(string inputFilePath, string outputFilePath)
     {
         this.inputFilePath = inputFilePath;
@@ -72,23 +74,41 @@ public class ClassTreeProcessor : IDisposable, IAsyncDisposable
 
         lock (doneSync)
         {
+            var lastWaitBuf = 0UL;
+            var lastWaitData = 0UL;
             while (!Monitor.Wait(doneSync, 2500))
             {
-                Volatile.Read(ref bufferFull[0]);
-                Volatile.Read(ref bufferFull[1]);
+                var currWaitBuf = Interlocked.Read(ref waitedForBuffer);
+                var currWaitData = Interlocked.Read(ref waitedForData);
                 var time = stopwatch.ElapsedMilliseconds;
-                Console.WriteLine($"Decompressed {Volatile.Read(ref decompressedData)} bytes ({decompressedData / (float) time:F2} kB/s), processed {Interlocked.Read(ref processedData)} bytes ({processedData / (float) time:F2} kB/s), found {superClassCount} superclasses (current {currentQid}), duration {time * 0.001f:F1} s, waited {waitedForBuffer} for buffer, {waitedForData} for data...");
+                Console.WriteLine($"{time * 0.001f:F1} s: Decompressed {BytesToString((long) Volatile.Read(ref decompressedData))} ({BytesToString((long) Math.Round(decompressedData / (float) time * 1000.0f))}/s) from {BytesToString(compressedPosition)} ({BytesToString((long) Math.Round(compressedPosition / (float) time * 1000.0f))}/s), {Percentage(compressedPosition, compressedSize)}, ETA {ComputeEta(compressedPosition, compressedSize, time)}, found {superClassCount} superclasses (now at Q{currentQid}), waited buff={currWaitBuf - lastWaitBuf}, data={currWaitData - lastWaitData}");
+                lastWaitBuf = currWaitBuf;
+                lastWaitData = currWaitData;
             }
         }
         stopwatch.Stop();
 
         var totalTime = stopwatch.ElapsedMilliseconds;
-        Console.WriteLine($"Done! Decompressed {decompressedData} bytes ({decompressedData / (float) totalTime:F2} kB/s), processed {processedData} bytes ({processedData / (float) totalTime:F2} kB/s), found {superClassCount} superclasses (current {currentQid}), duration {totalTime * 0.001f:F1} s, waited {waitedForBuffer} for buffer, {waitedForData} for data...");
+        Console.WriteLine($"Done! Decompressed {BytesToString((long) Volatile.Read(ref decompressedData))} ({BytesToString((long) Math.Round(decompressedData / (float) totalTime * 1000.0f))}/s) from {BytesToString(compressedPosition)} ({BytesToString((long) Math.Round(compressedPosition / (float) totalTime * 1000.0f))}/s), found {superClassCount} superclasses (now at Q{currentQid}), duration {totalTime * 0.001f:F1} s, waited {waitedForBuffer} for buffer, {waitedForData} for data");
+    }
+
+    private static string Percentage(long curr, long total) => total == 0 ? "0 %" : $"{curr * 100.0f / total:F0} %";
+
+    private static string ComputeEta(long curr, long total, long millis)
+    {
+        if (curr == 0)
+        {
+            return "?";
+        }
+
+        var timeSpan = TimeSpan.FromMilliseconds((total - curr) / (double) curr * millis);
+        return timeSpan.ToString(timeSpan.Days > 0 ? "d'.'hh':'mm':'ss" : "h':'mm':'ss", CultureInfo.InvariantCulture);
     }
 
     private void DecompressionThreadProc()
     {
         using var stream = File.OpenRead(inputFilePath);
+        compressedSize = stream.Length;
         using var decompressionStream = new BZip2Stream(stream, CompressionMode.Decompress, false);
         int bufferToWrite = 0;
         while (reachedEndOfStream == 0)
@@ -106,6 +126,7 @@ public class ClassTreeProcessor : IDisposable, IAsyncDisposable
                 SwitchBoolFlag(ref reachedEndOfStream, false, true);
             }
             Interlocked.Add(ref decompressedData, (ulong) readBytes);
+            compressedPosition = stream.Position;
 
             SwitchBoolFlag(ref bufferFull[bufferToWrite], false, true);
             bufferToWrite = 1 - bufferToWrite;
@@ -122,7 +143,7 @@ public class ClassTreeProcessor : IDisposable, IAsyncDisposable
             while (Volatile.Read(ref bufferFull[bufferToRead]) == 0)
             {
                 Interlocked.Increment(ref waitedForData);
-                Wait(100);
+                Wait(1000);
             }
 
             SwitchBoolFlag(ref consumingBuffer[bufferToRead], false, true);
@@ -221,7 +242,44 @@ public class ClassTreeProcessor : IDisposable, IAsyncDisposable
         // Thread.Yield();
         Thread.SpinWait(count);
     }
-    
+
+    private static string BytesToString(long value)
+    {
+        string suffix;
+        double readable;
+        switch (Math.Abs(value))
+        {
+            case >= 0x1000000000000000:
+                suffix = "EiB";
+                readable = value >> 50;
+                break;
+            case >= 0x4000000000000:
+                suffix = "PiB";
+                readable = value >> 40;
+                break;
+            case >= 0x10000000000:
+                suffix = "TiB";
+                readable = value >> 30;
+                break;
+            case >= 0x40000000:
+                suffix = "GiB";
+                readable = value >> 20;
+                break;
+            case >= 0x100000:
+                suffix = "MiB";
+                readable = value >> 10;
+                break;
+            case >= 0x400:
+                suffix = "KiB";
+                readable = value;
+                break;
+            default:
+                return value.ToString("0 B");
+        }
+
+        return (readable / 1024).ToString("0.## ", CultureInfo.InvariantCulture) + suffix;
+    }
+
     public void Dispose()
     {
         outputFile.Dispose();
