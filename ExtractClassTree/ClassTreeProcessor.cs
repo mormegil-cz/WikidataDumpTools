@@ -1,12 +1,16 @@
 using System.Diagnostics;
+using System.Globalization;
 using SharpCompress.Compressors;
 using SharpCompress.Compressors.BZip2;
 
 namespace ExtractClassTree;
 
-public class ClassTreeProcessor
+public class ClassTreeProcessor : IDisposable, IAsyncDisposable
 {
     private const int BufferSize = 0x10000;
+
+    private const string EntityUriPrefix = "http://www.wikidata.org/entity/Q";
+    private static readonly int EntityUriPrefixLength = EntityUriPrefix.Length;
 
     private readonly byte[][] buffers =
     {
@@ -26,18 +30,24 @@ public class ClassTreeProcessor
     private ulong decompressedData;
     private ulong processedData;
 
-    private ulong lineCount;
-
     private readonly object doneSync = new();
 
-    private readonly string filePath;
+    private readonly string inputFilePath;
 
     private readonly Thread decompressionThread;
     private readonly Thread parsingThread;
 
-    public ClassTreeProcessor(string filePath)
+    private readonly ClassTreeParser parser = new();
+
+    private long currentQid = -1;
+    private readonly BinaryWriter outputFile;
+
+    private ulong superClassCount;
+    
+    public ClassTreeProcessor(string inputFilePath, string outputFilePath)
     {
-        this.filePath = filePath;
+        this.inputFilePath = inputFilePath;
+        this.outputFile = new BinaryWriter(new FileStream(outputFilePath, FileMode.Create, FileAccess.Write, FileShare.Read));
 
         decompressionThread = new Thread(DecompressionThreadProc)
         {
@@ -67,18 +77,18 @@ public class ClassTreeProcessor
                 Volatile.Read(ref bufferFull[0]);
                 Volatile.Read(ref bufferFull[1]);
                 var time = stopwatch.ElapsedMilliseconds;
-                Console.WriteLine($"Decompressed {Volatile.Read(ref decompressedData)} bytes ({decompressedData / (float) time:F2} kB/s), processed {Interlocked.Read(ref processedData)} bytes ({processedData / (float) time:F2} kB/s), found {lineCount} lines, duration {time * 0.001f:F1} s, waited {waitedForBuffer} for buffer, {waitedForData} for data...");
+                Console.WriteLine($"Decompressed {Volatile.Read(ref decompressedData)} bytes ({decompressedData / (float) time:F2} kB/s), processed {Interlocked.Read(ref processedData)} bytes ({processedData / (float) time:F2} kB/s), found {superClassCount} superclasses (current {currentQid}), duration {time * 0.001f:F1} s, waited {waitedForBuffer} for buffer, {waitedForData} for data...");
             }
         }
         stopwatch.Stop();
 
         var totalTime = stopwatch.ElapsedMilliseconds;
-        Console.WriteLine($"Done! Decompressed {decompressedData} bytes ({decompressedData / (float) totalTime:F2} kB/s), processed {processedData} bytes ({processedData / (float) totalTime:F2} kB/s), found {lineCount} lines, duration {totalTime * 0.001f:F1} s, waited {waitedForBuffer} for buffer, {waitedForData} for data...");
+        Console.WriteLine($"Done! Decompressed {decompressedData} bytes ({decompressedData / (float) totalTime:F2} kB/s), processed {processedData} bytes ({processedData / (float) totalTime:F2} kB/s), found {superClassCount} superclasses (current {currentQid}), duration {totalTime * 0.001f:F1} s, waited {waitedForBuffer} for buffer, {waitedForData} for data...");
     }
 
     private void DecompressionThreadProc()
     {
-        using var stream = File.OpenRead(filePath);
+        using var stream = File.OpenRead(inputFilePath);
         using var decompressionStream = new BZip2Stream(stream, CompressionMode.Decompress, false);
         int bufferToWrite = 0;
         while (reachedEndOfStream == 0)
@@ -86,9 +96,7 @@ public class ClassTreeProcessor
             while (Volatile.Read(ref bufferFull[bufferToWrite]) != 0 || Volatile.Read(ref consumingBuffer[bufferToWrite]) != 0)
             {
                 Interlocked.Increment(ref waitedForBuffer);
-                // Thread.Sleep(10);
-                // Thread.Yield();
-                Thread.SpinWait(100);
+                Wait(100);
             }
 
             int readBytes = ReadFully(decompressionStream, buffers[bufferToWrite]);
@@ -114,9 +122,7 @@ public class ClassTreeProcessor
             while (Volatile.Read(ref bufferFull[bufferToRead]) == 0)
             {
                 Interlocked.Increment(ref waitedForData);
-                // Thread.Sleep(10);
-                // Thread.Yield();
-                Thread.SpinWait(100);
+                Wait(100);
             }
 
             SwitchBoolFlag(ref consumingBuffer[bufferToRead], false, true);
@@ -134,7 +140,6 @@ public class ClassTreeProcessor
 
         lock (doneSync)
         {
-            Volatile.Write(ref lineCount, lineCount);
             Monitor.PulseAll(doneSync);
             Console.WriteLine("Processing done");
         }
@@ -170,14 +175,34 @@ public class ClassTreeProcessor
                     // end of buffer
                     break;
                 }
-                if (curr == '\n')
+                var foundTriple = parser.ProcessCharacter(curr, buffer, i);
+                if (foundTriple != null)
                 {
-                    ++lineCount;
+                    var (subj, pred, obj) = foundTriple.GetValueOrDefault();
+                    if (pred == "http://www.wikidata.org/prop/direct/P279")
+                    {
+                        var subjQid = GetQidFromEntityUri(subj);
+                        var classQid = GetQidFromEntityUri(obj);
+                        if (subjQid != currentQid)
+                        {
+                            if (currentQid >= 0)
+                            {
+                                outputFile.Write(0L);
+                            }
+                            outputFile.Write(subjQid);
+                            currentQid = subjQid;
+                        }
+                        outputFile.Write(classQid);
+                        Interlocked.Increment(ref superClassCount);
+                    }
                 }
                 ++p;
             }
         }
+        parser.ProcessEndOfBuffer(buffer);
     }
+
+    private static long GetQidFromEntityUri(string uri) => Int64.Parse(uri.AsSpan(EntityUriPrefixLength), CultureInfo.InvariantCulture);
 
     private static void SwitchBoolFlag(ref int flag, bool from, bool to)
     {
@@ -188,5 +213,22 @@ public class ClassTreeProcessor
             throw new InvalidOperationException("Async state mismatch!");
         }
         // Debug.Assert(Volatile.Read(ref flag) == toVal);
+    }
+
+    private static void Wait(int count)
+    {
+        // Thread.Sleep(10);
+        // Thread.Yield();
+        Thread.SpinWait(count);
+    }
+    
+    public void Dispose()
+    {
+        outputFile.Dispose();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await outputFile.DisposeAsync();
     }
 }
